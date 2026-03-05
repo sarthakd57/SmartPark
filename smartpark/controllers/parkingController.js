@@ -3,21 +3,25 @@ const Slot = require("../models/Slot");
 const Booking = require("../models/Booking");
 const mongoose = require("mongoose");
 
-
-
 exports.createParkingLot = async (req, res) => {
   try {
-    const { name, latitude, longitude, total_slots, price_per_hour } = req.body;
+    const { name, address, latitude, longitude, total_slots, price_per_hour } = req.body;
+
+    if (!name || latitude == null || longitude == null || !total_slots || !price_per_hour) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
 
     const parkingLot = await ParkingLot.create({
       name,
+      address,
       location: {
         type: "Point",
         coordinates: [longitude, latitude]
       },
       total_slots,
       available_slots: total_slots,
-      price_per_hour
+      price_per_hour,
+      created_by: req.user ? req.user._id : undefined
     });
 
     const slots = [];
@@ -37,120 +41,85 @@ exports.createParkingLot = async (req, res) => {
   }
 };
 
-exports.getNearbyParking = async (req, res) => {
+// GET /api/parking/lots?lat=&lng=&radius=
+exports.getLots = async (req, res) => {
   try {
-    const { lat, lng, radius = 5000 } = req.query;
+    const { lat, lng, radius } = req.query;
 
-    const parkingLots = await ParkingLot.find({
-      location: {
-        $near: {
-          $geometry: {
-            type: "Point",
-            coordinates: [parseFloat(lng), parseFloat(lat)]
-          },
-          $maxDistance: parseInt(radius)
+    let query = { is_active: true };
+
+    if (lat && lng) {
+      const maxDistance = parseInt(radius || "5000", 10);
+      query = {
+        ...query,
+        location: {
+          $near: {
+            $geometry: {
+              type: "Point",
+              coordinates: [parseFloat(lng), parseFloat(lat)]
+            },
+            $maxDistance: maxDistance
+          }
         }
-      }
-    });
+      };
+    }
 
+    const parkingLots = await ParkingLot.find(query);
     res.json(parkingLots);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 };
 
-exports.getSlotsByLot = async (req, res) => {
+// GET /api/parking/lots/:id
+exports.getLotById = async (req, res) => {
   try {
-    const { lotId } = req.params;
+    const { id } = req.params;
 
-    const slots = await Slot.find({ lot_id: lotId });
-
-    res.json(slots);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
-exports.completeBooking = async (req, res) => {
-  try {
-    const { bookingId } = req.params;
-
-    const booking = await Booking.findById(bookingId)
-      .populate("lot_id")
-      .populate("slot_id");
-
-    if (!booking || booking.status !== "active") {
-      return res.status(400).json({ error: "Invalid booking" });
+    const lot = await ParkingLot.findById(id);
+    if (!lot) {
+      return res.status(404).json({ message: "Parking lot not found" });
     }
 
-    booking.end_time = new Date();
+    const slots = await Slot.find({ lot_id: id });
 
-    const hours = Math.ceil(
-      (booking.end_time - booking.start_time) / (1000 * 60 * 60)
-    );
-
-    booking.total_price = hours * booking.lot_id.price_per_hour;
-    booking.status = "completed";
-
-    await booking.save();
-
-    booking.slot_id.is_available = true;
-    await booking.slot_id.save();
-
-    await ParkingLot.findByIdAndUpdate(booking.lot_id._id, {
-      $inc: { available_slots: 1 }
+    res.json({
+      lot,
+      slots
     });
-
-    res.json(booking);
-
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 };
-exports.bookSlot = async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
 
-  try {
-    const { lotId } = req.params;
-    const { user_id } = req.body;
+// Utility used by booking controller to allocate a slot atomically
+exports._allocateSlotForBooking = async (lotId, userId, session) => {
+  const slot = await Slot.findOneAndUpdate(
+    { lot_id: lotId, is_available: true },
+    { $set: { is_available: false } },
+    { new: true, session }
+  );
 
-    // Atomically find and update slot
-    const slot = await Slot.findOneAndUpdate(
-      { lot_id: lotId, is_available: true },
-      { $set: { is_available: false } },
-      { new: true, session }
-    );
+  if (!slot) {
+    return null;
+  }
 
-    if (!slot) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(400).json({ error: "No available slots" });
-    }
+  await ParkingLot.findByIdAndUpdate(
+    lotId,
+    { $inc: { available_slots: -1 } },
+    { session }
+  );
 
-    await ParkingLot.findByIdAndUpdate(
-      lotId,
-      { $inc: { available_slots: -1 } },
-      { session }
-    );
-
-    const booking = await Booking.create(
-      [{
-        user_id,
+  const [booking] = await Booking.create(
+    [
+      {
+        user_id: userId,
         lot_id: lotId,
         slot_id: slot._id
-      }],
-      { session }
-    );
+      }
+    ],
+    { session }
+  );
 
-    await session.commitTransaction();
-    session.endSession();
-
-    res.status(201).json(booking[0]);
-
-  } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
-    res.status(500).json({ error: error.message });
-  }
+  return booking;
 };

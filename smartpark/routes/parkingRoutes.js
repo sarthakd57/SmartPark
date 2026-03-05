@@ -1,18 +1,17 @@
 const express = require("express");
 const router = express.Router();
-
 const {
   createParkingLot,
-  getNearbyParking,
-  getSlotsByLot,
-  bookSlot,
-  completeBooking
+  getLots,
+  getLotById
 } = require("../controllers/parkingController");
+const { authenticate, authorizeAdmin } = require("../middleware/authMiddleware");
 
-router.post("/create", createParkingLot);
-router.get("/nearby", getNearbyParking);
-router.get("/:lotId/slots", getSlotsByLot);
-router.post("/:lotId/book", bookSlot);
-router.put("/booking/:bookingId/complete", completeBooking);
+// Admin: create parking lots
+router.post("/admin/lots", authenticate, authorizeAdmin, createParkingLot);
+
+// Public/user: list and view lots
+router.get("/lots", getLots);
+router.get("/lots/:id", getLotById);
 
 module.exports = router;
